@@ -23,9 +23,10 @@ Defines interface for DB access
 """
 
 import logging
+import time
 
 from sqlalchemy import asc, create_engine, desc
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError, DBAPIError
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import exc
 from sqlalchemy.orm import joinedload
@@ -39,6 +40,8 @@ from glance.registry.db import models
 
 _ENGINE = None
 _MAKER = None
+_MAX_RETRIES = None
+_RETRY_INTERVAL = None
 BASE = models.BASE
 sa_logger = None
 logger = logging.getLogger(__name__)
@@ -62,6 +65,8 @@ STATUSES = ['active', 'saving', 'queued', 'killed', 'pending_delete',
 db_opts = [
     cfg.IntOpt('sql_idle_timeout', default=3600),
     cfg.StrOpt('sql_connection', default='sqlite:///glance.sqlite'),
+    cfg.IntOpt('sql_max_retries', default=10),
+    cfg.IntOpt('sql_retry_interval', default=1)
     ]
 
 
@@ -72,13 +77,16 @@ def configure_db(conf):
 
     :param conf: Mapping of configuration options
     """
-    global _ENGINE, sa_logger, logger
+    global _ENGINE, sa_logger, logger, _MAX_RETRIES, _RETRY_INTERVAL
     if not _ENGINE:
         conf.register_opts(db_opts)
         timeout = conf.sql_idle_timeout
         sql_connection = conf.sql_connection
+        _MAX_RETRIES = conf.sql_max_retries
+        _RETRY_INTERVAL = conf.sql_retry_interval
         try:
             _ENGINE = create_engine(sql_connection, pool_recycle=timeout)
+            _ENGINE.create = wrap_db_error(_ENGINE.create)
         except Exception, err:
             msg = _("Error configuring registry database with supplied "
                     "sql_connection '%(sql_connection)s'. "
@@ -115,7 +123,52 @@ def get_session(autocommit=True, expire_on_commit=False):
         _MAKER = sessionmaker(bind=_ENGINE,
                               autocommit=autocommit,
                               expire_on_commit=expire_on_commit)
-    return _MAKER()
+    session = _MAKER()
+    session.query = wrap_db_error(session.query)
+    session.flush = wrap_db_error(session.flush)
+    session.execute = wrap_db_error(session.execute)
+    session.begin = wrap_db_error(session.begin)
+    return session
+
+
+def is_db_connection_error(args):
+    """Return True if error in connecting to db."""
+    conn_err_codes = ('2002', '2006')
+    for err_code in conn_err_codes:
+        if args.find(err_code) != -1:
+            return True
+    return False
+
+
+def wrap_db_error(f):
+    """Retry DB connection. Copied from nova and modified."""
+    def _wrap(*args, **kwargs):
+        try:
+            return f(*args, **kwargs)
+        except OperationalError, e:
+            if not is_db_connection_error(e.args[0]):
+                raise
+
+            global _MAX_RETRIES
+            global _RETRY_INTERVAL
+            remaining_attempts = _MAX_RETRIES
+            while True:
+                logger.warning(_('SQL connection failed. %d attempts left.'),
+                                remaining_attempts)
+                remaining_attempts -= 1
+                time.sleep(_RETRY_INTERVAL)
+                try:
+                    return f(*args, **kwargs)
+                except OperationalError, e:
+                    if remaining_attempts == 0 or \
+                       not is_db_connection_error(e.args[0]):
+                        raise
+                except DBAPIError:
+                    raise
+        except DBAPIError:
+            raise
+    _wrap.func_name = f.func_name
+    return _wrap
 
 
 def image_create(context, values):
